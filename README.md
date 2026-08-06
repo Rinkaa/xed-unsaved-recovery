@@ -22,17 +22,33 @@ Authors: Pi Agent(On Deepseek-v4-flash); triggered by Ikigai<kaitensekai@qq.com>
 
 | Event | Behavior |
 | --- | --- |
-| Any document's content changes | ~2 s after typing stops, full text is snapshotted to `docs/<id>.txt` (index in `index.json`) |
+| Any document's content changes | after typing stops (configurable delay, default 2 s), full text is snapshotted to `docs/<id>.txt` (index in `index.json`) |
 | User saves the document (buffer == disk) | that document's snapshot is removed |
 | Closing tabs / windows / quitting xed | snapshots are kept (protects against accidental closes too) |
-| Power loss / crash | snapshots are kept (at most the last ~2 s of typing are lost) |
+| Power loss / crash | snapshots are kept (at most the last delay seconds of typing are lost) |
 | Next xed start | restore dialog pops up automatically if snapshots exist; also available anytime via **Tools → Restore Unsaved Documents...** |
-| Snapshots older than 7 days | auto-cleaned |
+| Snapshots older than the retention period (default 7 days) | auto-cleaned |
 
 To restore: select entries in the dialog → **Restore Selected**; content is
 placed in new untitled tabs (never written back to the original file). The
 dialog shows the original path for disk files so you can save them back.
 Restored tabs keep being snapshotted until you save them.
+
+## Configuration
+
+Open **Edit → Preferences → Extensions**, select *Unsaved Document Recovery*
+and press the **Preferences** button. Changes are applied immediately.
+
+Settings are stored in
+`~/.config/xed/plugins/unsaved-recovery/settings.ini` (a GSettings schema is
+not required):
+
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `snapshot-delay-seconds` | 2 | 1–300 | wait this long after typing stops before writing a snapshot |
+| `sweep-interval-seconds` | 30 | 5–3600 | safety-net sweep frequency |
+| `max-snapshot-chars` | 10,000,000 | 1,000–1e9 | skip snapshots for larger documents |
+| `retention-days` | 7 | 1–365 | how long snapshots are kept |
 
 ## Installation
 
@@ -43,6 +59,9 @@ cp unsaved_recovery.py unsaved_recovery.plugin ~/.local/share/xed/plugins/xed-un
 
 Restart xed → **Edit → Preferences → Extensions** → enable
 *Unsaved Document Recovery*.
+
+Requires xed ≥ 3.8 (libpeas-based plugin engine; the **Preferences** button
+needs libpeas-gtk).
 
 ## Verification
 
@@ -73,7 +92,8 @@ python3 -m unittest test_storage -v
 
 - Documents larger than 10,000,000 characters are not snapshotted (disk
   safety; noted in the debug log).
-- Snapshots are full-text copies taken ~2 s after typing stops, not
-  keystroke logs — at most the last ~2 s of input can be lost.
+- Snapshots are full-text copies taken after typing stops (configurable
+debounce, default 2 s), not keystroke logs — at most the last debounce
+period of input can be lost.
 - Restored content lands in new untitled tabs; save it to the original path
   yourself when needed.

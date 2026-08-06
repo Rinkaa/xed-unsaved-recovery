@@ -12,27 +12,40 @@
 # a file hits disk stays entirely with the user.
 #
 # Behavior:
-#   - ~2 s after editing stops, the full buffer text is snapshotted to
+#   - After editing stops (debounce, configurable), the full buffer text
+#     is snapshotted to
 #     ~/.local/share/xed/unsaved-recovery/docs/<id>.txt (index.json).
 #     The trigger condition is GtkTextBuffer.get_modified(): the buffer
 #     differs from disk, so a snapshot is taken.
 #   - When the user saves (buffer == disk), that snapshot is removed.
 #   - Closing tabs/windows, quitting xed, power loss and crashes all keep
-#     the snapshots; they are auto-cleaned after 7 days.
+#     the snapshots; they are auto-cleaned after a configurable period.
 #   - On the next xed start, if snapshots exist, a restore dialog pops up
 #     automatically; it can also be opened anytime via
 #     Tools -> Restore Unsaved Documents...
 #
+# Configuration (Edit -> Preferences -> Extensions -> Preferences button,
+# or edit the file directly):
+#   ~/.config/xed/plugins/unsaved-recovery/settings.ini
+#   [UnsavedRecovery]
+#   snapshot-delay-seconds = 2        (1-300)   debounce before snapshotting
+#   sweep-interval-seconds = 30       (5-3600)  safety-net sweep frequency
+#   max-snapshot-chars     = 10000000 (1000-1e9) skip larger documents
+#   retention-days         = 7        (1-365)   how long snapshots are kept
+#
 # Debug: XED_DEBUG_UNSAVED_RECOVERY=1 xed
 #
-# API references (linuxmint/xed master):
-#   xed/xed-window.h   -- tab-added / tab-removed / active-tab-changed,
-#                         create_tab(jump_to), get_documents(),
-#                         get_ui_manager()
-#   xed/xed-document.h -- is_untitled(), get_short_name_for_display(),
-#                         get_file().get_location(), saved/loaded signals
-#   xed/xed-tab.h      -- get_document()
+# API references:
+#   xed/xed-window.h       -- tab-added / tab-removed, create_tab(jump_to),
+#                             get_documents(), get_ui_manager()
+#   xed/xed-document.h     -- is_untitled(), get_short_name_for_display(),
+#                             get_file().get_location(), saved/loaded signals
+#   xed/xed-tab.h          -- get_document()
 #   xed/resources/ui/xed-ui.xml -- /MenuBar/ToolsMenu/ToolsOps_2 placeholder
+#   libpeas (xed >= 3.8 plugin engine): the module class is located by
+#   GType (find_extension_type); implementing PeasGtk.Configurable makes the
+#   Preferences button appear in the plugin manager dialog. The configure
+#   dialog is close-only, so the widget applies changes immediately.
 #   xed's native autosave (xed_tab_auto_save) only applies to saved
 #   documents (install_auto_save_timeout requires !is_untitled) and saves
 #   in place, which is the opposite of this plugin's semantics, so it is
@@ -47,6 +60,7 @@ import os
 import sys
 import time
 import uuid
+from typing import Optional
 
 import gi  # noqa: E402
 
@@ -54,7 +68,16 @@ gi.require_version("Gtk", "3.0")  # noqa: E402 -- xed is a GTK3 app; pin explici
 gi.require_version("Xed", "1.0")  # noqa: E402
 from gi.repository import GObject, Gtk, GLib, Xed  # noqa: E402
 
-__all__ = ["SnapshotStore", "UnsavedRecoveryPlugin"]
+try:  # noqa: E402
+    gi.require_version("PeasGtk", "1.0")  # noqa: E402 -- for the Preferences button
+    from gi.repository import PeasGtk  # noqa: E402
+
+    _CONFIGURABLE_BASES = (PeasGtk.Configurable,)
+except Exception:  # pragma: no cover -- exotic systems without libpeas-gtk
+    PeasGtk = None  # type: ignore[assignment]
+    _CONFIGURABLE_BASES = ()
+
+__all__ = ["SettingsStore", "SnapshotStore", "UnsavedRecoveryPlugin"]
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +100,128 @@ def _fmt_time(ts: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Settings (INI file via GLib.KeyFile; changes apply immediately because the
+# plugin reloads whenever the file mtime changes)
+# ---------------------------------------------------------------------------
+
+
+class SettingsStore:
+    """Per-user settings stored in an INI file.
+
+    Avoids installing a custom GSettings schema: mirrors the convention
+    used by other xed plugins (~/.config/xed/plugins/<plugin>/settings.ini).
+    """
+
+    GROUP = "UnsavedRecovery"
+
+    DEFAULTS = {
+        "snapshot-delay-seconds": 2,          # debounce before snapshotting
+        "sweep-interval-seconds": 30,         # safety-net sweep frequency
+        "max-snapshot-chars": 10_000_000,     # skip snapshots above this size
+        "retention-days": 7,                  # how long snapshots are kept
+    }
+
+    RANGES = {
+        "snapshot-delay-seconds": (1, 300),
+        "sweep-interval-seconds": (5, 3600),
+        "max-snapshot-chars": (1_000, 1_000_000_000),
+        "retention-days": (1, 365),
+    }
+
+    def __init__(self, path=None):
+        if path is None:
+            path = os.path.join(
+                GLib.get_user_config_dir(),
+                "xed", "plugins", "unsaved-recovery", "settings.ini",
+            )
+        self.path = path
+        self._values = {}
+        self._mtime = None
+        self.load()
+
+    # -- core ---------------------------------------------------
+
+    @classmethod
+    def _clamp(cls, key: str, value) -> int:
+        lo, hi = cls.RANGES[key]
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = cls.DEFAULTS[key]
+        return max(lo, min(hi, value))
+
+    def load(self) -> None:
+        raw = {}
+        keyfile = GLib.KeyFile()
+        try:
+            keyfile.load_from_file(self.path, GLib.KeyFileFlags.NONE)
+            for key in self.DEFAULTS:
+                try:
+                    raw[key] = keyfile.get_integer(self.GROUP, key)
+                except (GLib.Error, ValueError):
+                    pass  # missing key -> default
+        except (GLib.Error, OSError):
+            pass  # missing/corrupt file -> all defaults
+        self._values = {
+            key: self._clamp(key, raw.get(key, default))
+            for key, default in self.DEFAULTS.items()
+        }
+        try:
+            self._mtime = os.path.getmtime(self.path)
+        except OSError:
+            self._mtime = None
+
+    def reload_if_changed(self) -> None:
+        """Cheap mtime check; reloads only when the file changed on disk."""
+        try:
+            mtime = os.path.getmtime(self.path)
+        except OSError:
+            mtime = None
+        if mtime != self._mtime:
+            self.load()
+
+    def get(self, key: str) -> int:
+        return self._values[key]
+
+    def set(self, key: str, value) -> None:
+        self._values[key] = self._clamp(key, value)
+        self._save()
+
+    def reset(self) -> None:
+        self._values = dict(self.DEFAULTS)
+        self._save()
+
+    def _save(self) -> None:
+        keyfile = GLib.KeyFile()
+        for key, value in self._values.items():
+            keyfile.set_integer(self.GROUP, key, value)
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            keyfile.save_to_file(self.path)
+            self._mtime = os.path.getmtime(self.path)
+        except (GLib.Error, OSError) as e:
+            _debug(f"save settings failed: {e!r}")
+
+    # -- derived accessors ----------------------------------------
+
+    @property
+    def snapshot_delay_seconds(self) -> int:
+        return self.get("snapshot-delay-seconds")
+
+    @property
+    def sweep_interval_seconds(self) -> int:
+        return self.get("sweep-interval-seconds")
+
+    @property
+    def max_snapshot_chars(self) -> int:
+        return self.get("max-snapshot-chars")
+
+    @property
+    def retention_seconds(self) -> int:
+        return self.get("retention-days") * 86400
+
+
+# ---------------------------------------------------------------------------
 # Snapshot storage (pure file logic, unit-testable without a GUI)
 # ---------------------------------------------------------------------------
 
@@ -89,7 +234,7 @@ class SnapshotStore:
         docs/<id>.txt       full document text
     """
 
-    RETENTION_SECONDS = 7 * 24 * 3600  # 7 days
+    RETENTION_SECONDS = 7 * 24 * 3600  # default fallback: 7 days
 
     def __init__(self, base_dir=None):
         if base_dir is None:
@@ -184,13 +329,15 @@ class SnapshotStore:
             self.entries.values(), key=lambda e: e.get("updated", 0), reverse=True
         )
 
-    def cleanup_old(self) -> int:
+    def cleanup_old(self, retention_seconds: "Optional[int]" = None) -> int:
         """Drop snapshots older than the retention period; return count removed."""
+        if retention_seconds is None:
+            retention_seconds = self.RETENTION_SECONDS
         now = time.time()
         stale = [
             doc_id
             for doc_id, e in self.entries.items()
-            if now - e.get("updated", 0) > self.RETENTION_SECONDS
+            if now - e.get("updated", 0) > retention_seconds
         ]
         for doc_id in stale:
             self.remove(doc_id)
@@ -202,21 +349,21 @@ class SnapshotStore:
 # ---------------------------------------------------------------------------
 
 
-class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
+class UnsavedRecoveryPlugin(
+    GObject.Object, Xed.WindowActivatable, *_CONFIGURABLE_BASES
+):
     __gtype_name__ = "UnsavedRecoveryPlugin"
 
     window = GObject.Property(type=Xed.Window)
 
-    SNAPSHOT_DELAY_SECONDS = 2  # seconds after typing stops before snapshotting
-    SWEEP_INTERVAL_SECONDS = 30  # safety-net sweep for missed save/remove events
-    MAX_SNAPSHOT_CHARS = 10_000_000  # skip snapshots above this size (disk safety)
-
     def __init__(self):
         super().__init__()
+        self._settings = SettingsStore()
         self._store = SnapshotStore()
         self._tracked = {}  # id(doc) -> {"doc", "doc_id", "timeout_src", "dirty"}
         self._handlers = []  # [(obj, handler_id)]
         self._sweep_src = None
+        self._sweep_interval = None
         self._ui_merge_id = None
         self._ui_group = None
 
@@ -240,8 +387,9 @@ class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
 
     def do_activate(self):
         try:
+            self._settings.reload_if_changed()
             self._store = SnapshotStore()
-            cleaned = self._store.cleanup_old()
+            cleaned = self._store.cleanup_old(self._settings.retention_seconds)
             _debug(f"activate: cleaned {cleaned} stale snapshots")
 
             win = self.window
@@ -252,8 +400,9 @@ class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
             for doc in win.get_documents():
                 self._track_document(doc)
 
+            self._sweep_interval = self._settings.sweep_interval_seconds
             self._sweep_src = GLib.timeout_add_seconds(
-                self.SWEEP_INTERVAL_SECONDS, self._sweep
+                self._sweep_interval, self._sweep
             )
             self._add_menu_item()
 
@@ -314,10 +463,11 @@ class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
 
     def _on_changed(self, entry):
         """Buffer changed: schedule a snapshot for any doc with unsaved edits."""
+        self._settings.reload_if_changed()
         entry["dirty"] = True
         if entry["timeout_src"] is None:
             entry["timeout_src"] = GLib.timeout_add_seconds(
-                self.SNAPSHOT_DELAY_SECONDS, self._flush, entry
+                self._settings.snapshot_delay_seconds, self._flush, entry
             )
 
     def _on_saved(self, entry):
@@ -339,6 +489,7 @@ class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
             return False
         entry["dirty"] = False
         doc = entry["doc"]
+        self._settings.reload_if_changed()
         try:
             if not doc.get_modified():
                 # nothing unsaved (just saved / undid back to clean) -> no snapshot needed
@@ -346,7 +497,7 @@ class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
                     self._store.remove(entry["doc_id"])
                     entry["doc_id"] = None
                 return False
-            if doc.get_char_count() > self.MAX_SNAPSHOT_CHARS:
+            if doc.get_char_count() > self._settings.max_snapshot_chars:
                 _debug("document too large, skip snapshot")
                 return False
             text = doc.get_text(doc.get_start_iter(), doc.get_end_iter(), False)
@@ -370,8 +521,10 @@ class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
             self._flush(entry)
 
     def _sweep(self):
-        """Safety net: clean up missed saved-but-still-snapshotted docs and
-        flush any dirty docs whose debounce timer was lost."""
+        """Safety net: clean up missed saved-but-still-snapshotted docs, flush
+        dirty docs whose debounce timer was lost, apply configured retention,
+        and reschedule itself if the configured interval changed."""
+        self._settings.reload_if_changed()
         try:
             for entry in list(self._tracked.values()):
                 doc = entry["doc"]
@@ -381,9 +534,20 @@ class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
                     entry["dirty"] = False
                 elif entry["dirty"]:
                     self._flush(entry)
+            self._store.cleanup_old(self._settings.retention_seconds)
         except Exception as e:
             _debug(f"sweep failed: {e!r}")
-        return True  # keep the timer alive
+
+        # keep the timer alive, or reschedule with a new interval
+        interval = self._settings.sweep_interval_seconds
+        if interval != self._sweep_interval:
+            _debug(f"sweep interval changed to {interval}s")
+            self._sweep_interval = interval
+            if self._sweep_src is not None:
+                GLib.source_remove(self._sweep_src)
+            self._sweep_src = GLib.timeout_add_seconds(interval, self._sweep)
+            return False  # the old (fired) source is gone; the new one owns cadence
+        return True
 
     @staticmethod
     def _doc_title(doc) -> str:
@@ -592,3 +756,78 @@ class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
             )
             info.run()
             info.destroy()
+
+    # -- preferences (PeasGtk.Configurable) --------------------------
+
+    def do_create_configure_widget(self):
+        """Called by the plugin manager when the user opens the
+        Preferences button for this plugin. Returns a widget; the manager
+        wraps it in its own (close-only) dialog, so changes apply live."""
+        return _build_prefs_widget(self._settings)
+
+
+# ---------------------------------------------------------------------------
+# Preferences widget
+# ---------------------------------------------------------------------------
+
+
+def _build_prefs_widget(settings: SettingsStore) -> Gtk.Widget:
+    """Build the configuration widget: one spin button per setting, applied
+    immediately on change, plus a reset-to-defaults button."""
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    box.set_margin_start(12)
+    box.set_margin_end(12)
+    box.set_margin_top(12)
+    box.set_margin_bottom(12)
+
+    grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+    spins = {}
+
+    def add_row(row, key, label, unit, lower, upper, step, page):
+        adjustment = Gtk.Adjustment(
+            value=settings.get(key),
+            lower=lower,
+            upper=upper,
+            step_increment=step,
+            page_increment=page,
+        )
+        spin = Gtk.SpinButton(adjustment=adjustment, climb_rate=0.0, digits=0)
+        spin.set_numeric(True)
+        spin.connect("value-changed", lambda w, k=key: settings.set(k, w.get_value()))
+        spins[key] = spin
+
+        label_widget = Gtk.Label.new(label)
+        label_widget.set_halign(Gtk.Align.START)
+        grid.attach(label_widget, 0, row, 1, 1)
+        grid.attach(spin, 1, row, 1, 1)
+        unit_widget = Gtk.Label.new(unit)
+        unit_widget.set_halign(Gtk.Align.START)
+        grid.attach(unit_widget, 2, row, 1, 1)
+
+    add_row(0, "snapshot-delay-seconds", "Snapshot delay", "s",
+            1, 300, 1, 10)
+    add_row(1, "sweep-interval-seconds", "Sweep interval", "s",
+            5, 3600, 5, 30)
+    add_row(2, "max-snapshot-chars", "Max snapshot size", "chars",
+            1_000, 1_000_000_000, 100_000, 1_000_000)
+    add_row(3, "retention-days", "Snapshot retention", "days",
+            1, 365, 1, 7)
+
+    box.pack_start(grid, False, False, 0)
+
+    def on_reset(_btn):
+        settings.reset()
+        for key, spin in spins.items():
+            spin.set_value(settings.get(key))
+
+    reset_button = Gtk.Button.new_with_label("Restore defaults")
+    reset_button.connect("clicked", on_reset)
+    reset_button.set_halign(Gtk.Align.START)
+    box.pack_start(reset_button, False, False, 0)
+
+    hint = Gtk.Label.new("Changes are applied immediately.")
+    hint.set_halign(Gtk.Align.START)
+    box.pack_start(hint, False, False, 0)
+
+    box.show_all()
+    return box

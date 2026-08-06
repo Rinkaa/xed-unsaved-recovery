@@ -70,6 +70,16 @@ class SnapshotStoreTest(unittest.TestCase):
         self.assertIn("fresh", self.store.entries)
         self.assertNotIn("stale", self.store.entries)
 
+    def test_cleanup_old_custom_retention(self):
+        self.store.upsert("fresh", "t", "a")
+        self.store.upsert("stale", "t", "b")
+        self.store.entries["stale"]["updated"] = time.time() - 2 * 3600
+        self.store._save_index()
+        removed = self.store.cleanup_old(retention_seconds=3600)
+        self.assertEqual(removed, 1)
+        self.assertIn("fresh", self.store.entries)
+        self.assertNotIn("stale", self.store.entries)
+
     def test_list_sorted_by_updated_desc(self):
         self.store.upsert("old", "t", "a")
         time.sleep(0.01)
