@@ -346,10 +346,10 @@ class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
                     self._store.remove(entry["doc_id"])
                     entry["doc_id"] = None
                 return False
-            text = doc.get_text(doc.get_start_iter(), doc.get_end_iter(), False)
-            if len(text) > self.MAX_SNAPSHOT_CHARS:
+            if doc.get_char_count() > self.MAX_SNAPSHOT_CHARS:
                 _debug("document too large, skip snapshot")
                 return False
+            text = doc.get_text(doc.get_start_iter(), doc.get_end_iter(), False)
             if entry["doc_id"] is None:
                 entry["doc_id"] = uuid.uuid4().hex[:12]
             self._store.upsert(
@@ -526,7 +526,7 @@ class UnsavedRecoveryPlugin(GObject.Object, Xed.WindowActivatable):
         scroll.set_min_content_height(300)
         scroll.set_min_content_width(560)
         scroll.add(view)
-        dlg.vbox.pack_start(scroll, True, True, 0)
+        dlg.get_content_area().pack_start(scroll, True, True, 0)
         dlg.show_all()
 
         while True:
