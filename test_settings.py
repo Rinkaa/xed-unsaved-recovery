@@ -9,9 +9,12 @@ import shutil
 import tempfile
 import unittest
 
-from gi.repository import GLib
+import gi
 
-from unsaved_recovery import SettingsStore
+gi.require_version("Gtk", "3.0")  # must be pinned before importing Gtk
+from gi.repository import GLib, Gtk  # noqa: E402
+
+from unsaved_recovery import SettingsStore, _build_prefs_widget  # noqa: E402
 
 
 class SettingsStoreTest(unittest.TestCase):
@@ -74,6 +77,44 @@ class SettingsStoreTest(unittest.TestCase):
         os.unlink(self.path)
         self.store.reload_if_changed()
         self.assertEqual(self.store.get("retention-days"), 7)
+
+
+class PrefsWidgetTest(unittest.TestCase):
+    """The preferences widget: one spin button per setting, each with a
+    tooltip explaining the parameter (GUI construction only, no display)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="unsaved-recovery-prefs-test-")
+        self.settings = SettingsStore(path=os.path.join(self._tmp, "settings.ini"))
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_widget_has_four_spins_with_tooltips(self):
+        box = _build_prefs_widget(self.settings)
+        spins = [
+            child
+            for grid in box.get_children()
+            if isinstance(grid, Gtk.Grid)
+            for child in grid.get_children()
+            if isinstance(child, Gtk.SpinButton)
+        ]
+        self.assertEqual(len(spins), 4)
+        for spin in spins:
+            self.assertTrue(spin.get_tooltip_text(), "spin button tooltip missing")
+
+    def test_widget_labels_have_tooltips(self):
+        box = _build_prefs_widget(self.settings)
+        labels = [
+            child
+            for grid in box.get_children()
+            if isinstance(grid, Gtk.Grid)
+            for child in grid.get_children()
+            if isinstance(child, Gtk.Label)
+        ]
+        self.assertEqual(len(labels), 8)  # 4 labels + 4 unit labels
+        for label in labels:
+            self.assertTrue(label.get_tooltip_text(), "label tooltip missing")
 
 
 if __name__ == "__main__":

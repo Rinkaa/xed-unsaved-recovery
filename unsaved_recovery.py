@@ -115,10 +115,10 @@ class SettingsStore:
     GROUP = "UnsavedRecovery"
 
     DEFAULTS = {
-        "snapshot-delay-seconds": 2,          # debounce before snapshotting
-        "sweep-interval-seconds": 30,         # safety-net sweep frequency
-        "max-snapshot-chars": 10_000_000,     # skip snapshots above this size
-        "retention-days": 7,                  # how long snapshots are kept
+        "snapshot-delay-seconds": 2,  # debounce before snapshotting
+        "sweep-interval-seconds": 30,  # safety-net sweep frequency
+        "max-snapshot-chars": 10_000_000,  # skip snapshots above this size
+        "retention-days": 7,  # how long snapshots are kept
     }
 
     RANGES = {
@@ -132,7 +132,10 @@ class SettingsStore:
         if path is None:
             path = os.path.join(
                 GLib.get_user_config_dir(),
-                "xed", "plugins", "unsaved-recovery", "settings.ini",
+                "xed",
+                "plugins",
+                "unsaved-recovery",
+                "settings.ini",
             )
         self.path = path
         self._values = {}
@@ -783,7 +786,7 @@ def _build_prefs_widget(settings: SettingsStore) -> Gtk.Widget:
     grid = Gtk.Grid(column_spacing=12, row_spacing=8)
     spins = {}
 
-    def add_row(row, key, label, unit, lower, upper, step, page):
+    def add_row(row, key, label, unit, tooltip, lower, upper, step, page):
         adjustment = Gtk.Adjustment(
             value=settings.get(key),
             lower=lower,
@@ -793,25 +796,58 @@ def _build_prefs_widget(settings: SettingsStore) -> Gtk.Widget:
         )
         spin = Gtk.SpinButton(adjustment=adjustment, climb_rate=0.0, digits=0)
         spin.set_numeric(True)
+        spin.set_tooltip_text(tooltip)
         spin.connect("value-changed", lambda w, k=key: settings.set(k, w.get_value()))
         spins[key] = spin
 
         label_widget = Gtk.Label.new(label)
         label_widget.set_halign(Gtk.Align.START)
+        label_widget.set_tooltip_text(tooltip)
         grid.attach(label_widget, 0, row, 1, 1)
         grid.attach(spin, 1, row, 1, 1)
         unit_widget = Gtk.Label.new(unit)
         unit_widget.set_halign(Gtk.Align.START)
+        unit_widget.set_tooltip_text(tooltip)
         grid.attach(unit_widget, 2, row, 1, 1)
 
-    add_row(0, "snapshot-delay-seconds", "Snapshot delay", "s",
-            1, 300, 1, 10)
-    add_row(1, "sweep-interval-seconds", "Sweep interval", "s",
-            5, 3600, 5, 30)
-    add_row(2, "max-snapshot-chars", "Max snapshot size", "chars",
-            1_000, 1_000_000_000, 100_000, 1_000_000)
-    add_row(3, "retention-days", "Snapshot retention", "days",
-            1, 365, 1, 7)
+    add_row(
+        0, "snapshot-delay-seconds", "Snapshot delay", "s",
+        "Delay between the last keystroke and writing a snapshot. "
+        "A crash or power loss can lose at most this many seconds of "
+        "typing. Lower values protect more, higher values reduce disk "
+        "writes while typing.",
+        1, 300, 1, 10,
+    )
+    add_row(
+        1, "sweep-interval-seconds", "Sweep interval", "s",
+        "Frequency of the background safety-net pass: it removes "
+        "snapshots of documents that were already saved, flushes missed "
+        "debounce timers, and applies the retention period. "
+        "Edge-case insurance; the default is fine for almost everyone.",
+        5, 3600, 5, 30,
+    )
+    add_row(
+        2,
+        "max-snapshot-chars",
+        "Max snapshot size",
+        "chars",
+        "Documents whose buffer is larger than this are not snapshotted "
+        "at all, to protect your disk. Each snapshot stores the full "
+        "buffer text, so a document near this limit produces roughly "
+        "that many characters per snapshot file.",
+        1_000,
+        1_000_000_000,
+        100_000,
+        1_000_000,
+    )
+    add_row(
+        3, "retention-days", "Snapshot retention", "days",
+        "How long snapshots are kept before automatic cleanup. "
+        "Covers crash/power-loss recovery and accidental tab closes. "
+        "A restored snapshot is consumed immediately and no longer "
+        "counts against this period.",
+        1, 365, 1, 7,
+    )
 
     box.pack_start(grid, False, False, 0)
 

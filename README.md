@@ -38,6 +38,7 @@ Restored tabs keep being snapshotted until you save them.
 
 Open **Edit → Preferences → Extensions**, select *Unsaved Document Recovery*
 and press the **Preferences** button. Changes are applied immediately.
+Hover any setting (label or value) for a detailed explanation.
 
 Settings are stored in
 `~/.config/xed/plugins/unsaved-recovery/settings.ini` (a GSettings schema is
