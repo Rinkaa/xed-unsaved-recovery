@@ -1,0 +1,9 @@
+[Plugin]
+Loader=python3
+Module=unsaved_recovery
+IAge=3
+Name=Unsaved Document Recovery
+Description=Snapshots unsaved edits (untitled docs and modified files) to a private recovery folder; never writes to your files. Restore after crash or power loss.
+Authors=Pi Agent(On Deepseek-v4-flash); triggered by Ikigai<kaitensekai@qq.com>
+Copyright=Copyright (c) 2026 Ikigai
+Website=
